@@ -4,10 +4,10 @@ Starting with the release version [0.10.0](https://github.com/cloud-hypervisor/c
 
 __Requirements__
 
-- Host with KVM enabled 
+- Host with KVM enabled
 - [UEFI](uefi.md) capable Windows guest image with Virtio drivers integrated
 
-Any modern Windows Server version is compatible. Cloud Hypervisor has been successfully tested with Windows Server 2019 and Windows Server Core 2004.
+Any modern Windows Server version is compatible, as well as Windows 11. Cloud Hypervisor has been successfully tested with Windows Server 2019, Windows Server Core 2004 and Windows 11 IoT Enterprise LTSC 2024.
 
 At the current stage, only UEFI capable Windows images are supported. This implies the presence of the OVMF firmware during the Windows installation and in any subsequent usage. BIOS boot is not supported.
 
@@ -20,10 +20,13 @@ The subsequent sections will tell, in detail, how to prepare an appropriate Wind
 __Prerequisites__
 
 - QEMU, version >=5.0.0 is recommended.
-- Windows installation ISO. Obtained through MSDN, Visual Studio subscription, evaluation center, etc. 
+- Windows installation ISO. Obtained through MSDN, Visual Studio subscription, evaluation center, etc.
 - [VirtIO driver ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/)
+    - Please use the [VirtIO Windows 11 attestation file](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/upstream-virtio/virtio-win11-attestation-0.1-258.zip)
+    for Windows 11
 - Suitable firmware for Cloud Hypervisor (`CLOUDHV.fd`) and for QEMU (`OVMF.fd`)
 - With the suggested image size of 30G, there should be enough free disk space to hold the installation ISO and any other necessary files
+    - Depending on the user applications (like a DB), increasing this image size beforehand is recommended
 
 This step currently requires QEMU to install Windows onto the guest. QEMU is only used at the preparation stage, the resulting image is then fully functional with Cloud Hypervisor.
 
@@ -37,29 +40,71 @@ OVMF_DIR=./FV
 ```
 
 Create an empty image file, `raw` is supported.
+
 ```shell
 qemu-img create -f raw $IMG_FILE 30G
 ```
 
-Begin the Windows installation process under QEMU
+Begin the Windows installation process under QEMU for Windows Server:
+
 ```shell
 qemu-system-x86_64 \
-	-machine q35,accel=kvm \
-	-cpu host \
-	-m 4G \
-	-bios ./$OVMF_DIR/OVMF_CODE.fd \
-	-cdrom ./$WIN_ISO_FILE \
-	-drive file=./$VIRTIO_ISO_FILE,index=0,media=cdrom \
-	-drive if=none,id=root,file=./$IMG_FILE \
-	-device virtio-blk-pci,drive=root,disable-legacy=on \
-	-device virtio-net-pci,netdev=mynet0,disable-legacy=on \
-	-netdev user,id=mynet0 \
-	-vga std
+       -machine q35,accel=kvm \
+       -cpu host \
+       -m 4G \
+       -bios ./$OVMF_DIR/OVMF_CODE.fd \
+       -cdrom ./$WIN_ISO_FILE \
+       -drive file=./$VIRTIO_ISO_FILE,index=0,media=cdrom \
+       -drive if=none,id=root,file=./$IMG_FILE \
+       -device virtio-blk-pci,drive=root,disable-legacy=on \
+       -device virtio-net-pci,netdev=mynet0,disable-legacy=on \
+       -netdev user,id=mynet0 \
+       -vga std
+```
+
+For Windows 11 TPM 2.0 is needed. You can use `swtpm` to achieve that:
+
+```shell
+# Create directory to store state
+mkdir -p /tmp/mytpm1
+# Start swtpm deamon for TPM 2.0 support
+swtpm socket \
+    --tpm2 \
+    --ctrl type=unixio,path=/tmp/swtpm-sock \
+    --tpmstate dir=/tmp/mytpm1 \
+    --flags startup-clear \
+    --log level=20 \
+    --log file=/tmp/swtpm.log \
+    --daemon
+```
+
+Begin the Windows 11 installation process under QEMU like this:
+
+```shell
+qemu-system-x86_64 \
+    -enable-kvm \
+    -m 4G \
+    -cpu host,+vmx \
+    -smp 4 \
+    -machine type=q35,accel=kvm \
+    -bios $OVMF_DIR/OVMF.fd \
+    -cdrom ./$WIN_ISO_FILE \
+    -drive file=./$VIRTIO_ISO_FILE,media=cdrom \
+    -drive if=none,format=raw,id=root,file=./$IMG_FILE      \
+    -device virtio-blk-pci,drive=root,disable-legacy=on    \
+    -device virtio-net-pci,netdev=net0,disable-legacy=on  \
+    -boot order=d \
+    -netdev user,id=net0 \
+    -chardev socket,id=chrtpm,path=/tmp/swtpm-sock \
+    -tpmdev emulator,id=tpm0,chardev=chrtpm \
+    -device tpm-tis,tpmdev=tpm0
 ```
 
 Before the installation can proceed, point the Windows installation program to the VirtIO disk and install the necessary storage controller drivers. After that, the attached hard drive will become visible and the actual installation can commence.
 
-After the installation has completed, proceed further to the configuration section. QEMU will be needed at least once more to enable the Windows Special Administration Console (SAC) and to possibly install extra device drivers.
+Do not install network drivers for Windows 11 just yet, if you don't want to be forced to log-in to/create a Microsoft account. Simply select `I don't have internet` for now.
+
+After the installation has completed, proceed further to the [configuration section](#image-configuration). QEMU will be needed at least once more to enable/install the Windows Special Administration Console (SAC) and to possibly install extra device drivers.
 
 ## Image Usage
 
@@ -67,13 +112,13 @@ The basic command to boot a Windows image. The configuration section should be c
 
 ```shell
 cloud-hypervisor \
-	--kernel ./$OVMF_DIR/CLOUDHV.fd \
-	--disk path=./$IMG_FILE \
-	--cpus boot=1,kvm_hyperv=on \
-	--memory size=4G \
-	--serial tty \
-	--console off \
-	--net tap=
+       --kernel ./$OVMF_DIR/CLOUDHV.fd \
+       --disk path=./$IMG_FILE \
+       --cpus boot=1,kvm_hyperv=on \
+       --memory size=4G \
+       --serial tty \
+       --console off \
+       --net tap=
 ```
 
 It is necessary to always:
@@ -85,19 +130,25 @@ In cases where the host processor supports address space > 39 bits, it might be 
 
 To daemonize the Cloud Hypervisor process, `nohup` can be used. Some STDIO redirections might need to be done. In a simple case it is sufficient to just redirect all the output to `/dev/null`.
 
+Be aware, currently, running the Windows 11 VM on Cloud Hypervisor with TPM 2.0 was not proven successful: `thread 'vcpu0' panicked`. Running the VM without is a valid option though. Therefore the command as shown above is also valid for a Windows 11 VM.
+
 ## Image Configuration
 
 ### Device Drivers
 
 After the Windows installation has finished under QEMU, there might be still devices with no drivers installed. This might happen for example, when a device was not used during the installation. In particular it is important to ensure that the VirtIO network device is setup correctly because further steps for the configuration and the usage require network in most case.
 
-Boot once more under QEMU and use the [Device Manager](https://support.microsoft.com/en-in/help/4028443/windows-10-update-drivers), to ensure all the device drivers, and especially the network card, are installed correctly. Also, as Cloud Hypervisor can introduce new devices, it is advisable to repeat the procedure while booted under Cloud Hypervisor, when the RDP access to the image is functional.
+Boot once more under QEMU and use the [Device Manager](https://support.microsoft.com/en-in/help/4028443/windows-10-update-drivers), to ensure all the device drivers, and especially the network card, are installed correctly. If not, right click on the unknown network device, choose `Update driver` and browse to the `NetKvm` directory on the CD.
+
+Also, as Cloud Hypervisor can introduce new devices, it is advisable to repeat the procedure while booted under Cloud Hypervisor, when the RDP access to the image is functional.
 
 ### Windows Special Administration Console (SAC) enablement
 
 SAC provides a text based console access to the Windows guest. As Cloud Hypervisor doesn't implement a VGA adaptor, SAC is an important instrument for the Windows guest management.
 
-Boot the Windows image under QEMU and execute the below commands to permanently enable SAC
+Boot the Windows image under QEMU. For all non-server Windows versions, the SAC needs to be downloaded and enabled first in the `Optional features` menu of Windows.
+
+Execute the below commands to permanently enable SAC. You might need admin privileges.
 
 ```cmd
 bcdedit /emssettings emsport:1 emsbaudrate:115200
@@ -105,15 +156,14 @@ bcdedit /ems on
 bcdedit /bootems on
 ```
 
-Once SAC is enabled, the image can be booted under Cloud Hypervisor. The SAC prompt will show up 
+Once SAC is enabled, the image can be booted under Cloud Hypervisor. The SAC prompt will show up
 
 <pre>
-Computer is booting, SAC started and initialized.                               
-                                                                                
-Use the "ch -?" command for information about using channels.                   
-Use the "?" command for general help.                                           
-                                                                                
-                                                                                
+Computer is booting, SAC started and initialized.
+
+Use the "ch -?" command for information about using channels.
+Use the "?" command for general help.
+
 SAC>
 </pre>
 
@@ -127,7 +177,7 @@ Channel: Cmd0001
 SAC>ch -si 1
 </pre>
 
-See also the [links](#Links) section for a more extended SAC documentation.
+See also the [links](#links) section for a more extended SAC documentation.
 
 ## Network
 
@@ -139,7 +189,7 @@ As the simplest option, using `--net tap=` in the Cloud Hypervisor command line 
 
 <pre>
 SAC>i 10 192.168.249.2 255.255.255.0 192.168.249.1
-</pre> 
+</pre>
 
 Where `10` is the device index as shown by the `i` command.
 
@@ -149,26 +199,38 @@ Additional steps are necessary to provide the guest with internet access.
 
 - On the guest, add the DNS server either by using `netsh` or by opening `Network and Connectivity Center` and editing the adapter properties.
 - On the host, configure the traffic forwarding. Replace the `NET_DEV` with the name of your network device.
+
 ```shell
 NET_DEV=wlp3s0
 sysctl -w net.ipv4.ip_forward=1
 iptables -t nat -A POSTROUTING -o $NET_DEV -j MASQUERADE
 ```
 
+If needed, you can also allow ICMP from host to guest via the following command executed on the guest:
+
+```shell
+netsh advfirewall firewall add rule name="Allow ICMPv4" protocol=icmpv4:8,any dir=in action=allow
+```
+
+This will enable simple `ping` requests from your host to the guest.
+
 ### Remote Desktop Protocol (RDP) enablement
 
 #### Using QEMU
-  - Execute `SystemPropertiesRemote`
-  - In the properties window, choose "Allow remote connections to this computer"
-  - Click "Select Users" and add some user to the allow list
+
+- Execute `SystemPropertiesRemote`
+- In the properties window, choose "Allow remote connections to this computer"
+- Click "Select Users" and add some user to the allow list
+
 #### Using powershell
+
 ```powershell
 Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\" -Name "fDenyTSConnections" -Value 0
 Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 Add-LocalGroupMember -Group "Remote Desktop Users" -Member someuser
 ```
- 
-Administrators can always RDP, non administrator users have to be explicitly enabled. 
+
+Administrators can always RDP, non administrator users have to be explicitly enabled.
 
 Once the configuration is set, RDP clients can connect to `192.168.249.2`.
 
@@ -182,7 +244,15 @@ Start-Service sshd
 Set-Service -Name sshd -StartupType ‘Automatic’
 ```
 
-This allows for SSH login from a remote machine, for example through the `administrator` user: `ssh administrator@192.168.249.2`. For a more detailed OpenSSH guide, please follow the MSDN article from the [links](#links) section.
+This allows for SSH login from a remote machine, for example through the `administrator` user: `ssh administrator@192.168.249.2`.
+
+On Windows 11, opening the firewall was needed as well:
+
+```powershell
+New-NetFirewallRule -Name sshd -DisplayName "OpenSSH Server" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
+```
+
+For a more detailed OpenSSH guide, please follow the MSDN article from the [links](#links) section.
 
 ## Hotplug capability
 
@@ -196,6 +266,8 @@ Disk hotplug and hot-remove are supported. After the device has been hotplugged,
 
 ## Debugging
 
+Disclaimer: This chapter was not verified on Windows 11 yet. Proceed with care.
+
 The Windows guest debugging process relies heavily on QEMU and [socat](http://www.dest-unreach.org/socat/). The procedure requires two Windows VMs:
 
 - A debugger VM running under QEMU.
@@ -203,7 +275,7 @@ The Windows guest debugging process relies heavily on QEMU and [socat](http://ww
 
 The connection between both guests happens over TCP, whereby on the guest side it is automatically translated to a COM port. Because the VMs are connected through TCP, the debugging infrastructure can be distributed over the network. The serial port, while slowly transferring data, is common enough to support a wide range of cases and tools.
 
-In this exercise, [WinDbg](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/) is used. Any other debugger of choice with the ability to use serial connection can be used instead. 
+In this exercise, [WinDbg](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/) is used. Any other debugger of choice with the ability to use serial connection can be used instead.
 
 ### Debugger and Debuggee
 
@@ -215,17 +287,17 @@ To create the debugger Windows VM, the following command can be used:
 
 ```shell
 qemu-system-x86_64 \
-	-machine q35,accel=kvm \
-	-cpu host \
-	-smp 1 \
-	-m 4G \
-	-cdrom ./$WIN_ISO_FILE \
-	-drive file=./$VIRTIO_ISO_FILE,index=0,media=cdrom
-	-drive if=none,id=root,file=./windbg-disk.raw \
-	-device virtio-blk-pci,drive=root,disable-legacy=on \
-	-device virtio-net-pci,netdev=mynet0,disable-legacy=on \
-	-netdev user,id=mynet0,net=192.168.178.0/24,host=192.168.178.1,dhcpstart=192.168.178.64,hostname=windbg-host \
-	-vga std
+       -machine q35,accel=kvm \
+       -cpu host \
+       -smp 1 \
+       -m 4G \
+       -cdrom ./$WIN_ISO_FILE \
+       -drive file=./$VIRTIO_ISO_FILE,index=0,media=cdrom
+       -drive if=none,id=root,file=./windbg-disk.raw \
+       -device virtio-blk-pci,drive=root,disable-legacy=on \
+       -device virtio-net-pci,netdev=mynet0,disable-legacy=on \
+       -netdev user,id=mynet0,net=192.168.178.0/24,host=192.168.178.1,dhcpstart=192.168.178.64,hostname=windbg-host \
+       -vga std
 ```
 
 A non server Windows OS like Windows 10 can be used to carry the debugging tools in the debugger VM.
@@ -256,7 +328,7 @@ bcdedit /debug on
 bcdedit /bootdebug on
 ```
 
-##### Turn on boot manager debug 
+##### Turn on boot manager debug
 
 ```cmd
 bcdedit /set {bootmgr} bootdebug on
@@ -276,16 +348,16 @@ bcdedit /set {default} bootstatuspolicy ignoreallfailures
 
 ```shell
 qemu-system-x86_64 \
-	-machine q35,accel=kvm \
-	-cpu host \
-	-smp 1 \
-	-m 4G \
-	-drive if=none,id=root,file=./windbg-disk.raw \
-	-device virtio-blk-pci,drive=root,disable-legacy=on \
-	-serial tcp::4445,server,nowait \
-	-device virtio-net-pci,netdev=mynet0,disable-legacy=on \
-	-netdev user,id=mynet0,net=192.168.178.0/24,host=192.168.178.1,dhcpstart=192.168.178.64,hostname=windbg-host \
-	-vga std
+       -machine q35,accel=kvm \
+       -cpu host \
+       -smp 1 \
+       -m 4G \
+       -drive if=none,id=root,file=./windbg-disk.raw \
+       -device virtio-blk-pci,drive=root,disable-legacy=on \
+       -serial tcp::4445,server,nowait \
+       -device virtio-net-pci,netdev=mynet0,disable-legacy=on \
+       -netdev user,id=mynet0,net=192.168.178.0/24,host=192.168.178.1,dhcpstart=192.168.178.64,hostname=windbg-host \
+       -vga std
 ```
 
 Note, this VM has the networking enabled. It is needed, because symbols and sources might need to be fetched from a network location.
@@ -308,20 +380,21 @@ Once started, WinDbg will wait for an incoming connection which is going to be i
 ##### Under QEMU
 
 Essentially it would be the command like depicted in the guest preparation sections, with a few modifications:
+
 ```shell
 qemu-system-x86_64 \
-	-machine q35,accel=kvm \
-	-cpu host \
-	-m 4G \
-	-bios ./$OVMF_DIR/OVMF_CODE.fd \
-	-cdrom ./$WIN_ISO_FILE \
-	-drive file=./$VIRTIO_ISO_FILE,index=0,media=cdrom
-	-drive if=none,id=root,file=./$IMG_FILE \
-	-device virtio-blk-pci,drive=root,disable-legacy=on \
-	-device virtio-net-pci,netdev=mynet0,disable-legacy=on \
-	-netdev user,id=mynet0 \
-	-serial tcp:127.0.0.1:4445 \
-	-vga std
+       -machine q35,accel=kvm \
+       -cpu host \
+       -m 4G \
+       -bios ./$OVMF_DIR/OVMF_CODE.fd \
+       -cdrom ./$WIN_ISO_FILE \
+       -drive file=./$VIRTIO_ISO_FILE,index=0,media=cdrom
+       -drive if=none,id=root,file=./$IMG_FILE \
+       -device virtio-blk-pci,drive=root,disable-legacy=on \
+       -device virtio-net-pci,netdev=mynet0,disable-legacy=on \
+       -netdev user,id=mynet0 \
+       -serial tcp:127.0.0.1:4445 \
+       -vga std
 ```
 
 It is to see, that `-serial` parameter is used here, to establish the connection with the debugger VM.
